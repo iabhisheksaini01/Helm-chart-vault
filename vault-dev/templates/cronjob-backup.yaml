@@ -1,0 +1,119 @@
+{{- if .Values.backup.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "vault.fullname" . }}-backup
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "vault.labels" . | nindent 4 }}
+spec:
+  schedule: {{ .Values.backup.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: {{ .Values.backup.historyLimit | default 3 }}
+  failedJobsHistoryLimit: {{ .Values.backup.historyLimit | default 1 }}
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        metadata:
+          labels:
+            app: {{ include "vault.fullname" . }}-backup
+        spec:
+          serviceAccountName: {{ include "vault.fullname" . }}-vault-sa
+          restartPolicy: OnFailure
+          containers:
+            - name: backup
+              image: minio/mc:latest
+              env:
+                - name: VAULT_ADDR
+                  value: {{ .Values.backup.vault.address | quote }}
+                - name: MINIO_ENDPOINT
+                  value: {{ .Values.backup.minio.endpoint | quote }}
+                - name: MINIO_ACCESS_KEY
+                  value: {{ .Values.backup.minio.accessKey | quote }}
+                - name: MINIO_SECRET_KEY
+                  value: {{ .Values.backup.minio.secretKey | quote }}
+                - name: MINIO_BUCKET
+                  value: {{ .Values.backup.minio.bucket | quote }}
+                - name: RETENTION_COUNT
+                  value: {{ .Values.backup.minio.retentionCount | default 6 | quote }}
+                - name: ROOT_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "vault.fullname" . }}-main-vault-keys
+                      key: root-token
+                      optional: true
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -e
+
+                  echo "=== Vault Raft Backup ==="
+                  TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+
+                  if [ -z "$ROOT_TOKEN" ]; then
+                    echo "ERROR: Vault root token secret not yet available!"
+                    exit 1
+                  fi
+
+                  # ── Step 1: Find leader with retry ───────────────────────────
+                  echo "[1/3] Finding active Vault leader..."
+                  LEADER_ADDR=""
+                  for i in $(seq 1 5); do
+                    LEADER_ADDR=$(curl -sf --connect-timeout 5 \
+                      --header "X-Vault-Token: ${ROOT_TOKEN}" \
+                      "${VAULT_ADDR}/v1/sys/leader" 2>/dev/null | grep -o '"leader_address":"[^"]*"' | awk -F'"' '{print $4}' || true)
+                    if [ -n "$LEADER_ADDR" ] && [ "$LEADER_ADDR" != "null" ]; then
+                      break
+                    fi
+                    echo "  Attempt ${i}/5: Leader not found, retrying in 10s..."
+                    sleep 10
+                  done
+
+                  if [ -z "$LEADER_ADDR" ] || [ "$LEADER_ADDR" = "null" ]; then
+                    echo "ERROR: Could not determine Vault leader after 5 attempts!"
+                    exit 1
+                  fi
+                  # Strip trailing slash
+                  LEADER_ADDR="${LEADER_ADDR%/}"
+                  echo "  Active leader: ${LEADER_ADDR}"
+
+                  # ── Step 2: Take Raft snapshot ───────────────────────────────
+                  SNAPSHOT_FILE="/tmp/vault-snapshot-${TIMESTAMP}.snap"
+                  echo "[2/3] Taking Raft snapshot from leader..."
+                  curl -sSf --connect-timeout 10 --max-time 120 \
+                    --header "X-Vault-Token: ${ROOT_TOKEN}" \
+                    --output "${SNAPSHOT_FILE}" \
+                    "${LEADER_ADDR}/v1/sys/storage/raft/snapshot"
+
+                  SNAP_SIZE=$(stat -c%s "${SNAPSHOT_FILE}" 2>/dev/null || stat -f%z "${SNAPSHOT_FILE}" 2>/dev/null || echo 0)
+                  echo "  Snapshot size: ${SNAP_SIZE} bytes"
+
+                  if [ "${SNAP_SIZE:-0}" -lt 1024 ]; then
+                    echo "ERROR: Snapshot too small (${SNAP_SIZE} bytes) — likely corrupt!"
+                    exit 1
+                  fi
+
+                  # ── Step 3: Upload to MinIO & Retention ──────────────────────
+                  echo "[3/3] Uploading and applying retention policy..."
+                  mc alias set minio "${MINIO_ENDPOINT}" "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}" --insecure > /dev/null 2>&1
+                  mc mb minio/${MINIO_BUCKET} --ignore-existing --insecure > /dev/null 2>&1
+
+                  mc cp "${SNAPSHOT_FILE}" "minio/${MINIO_BUCKET}/vault-snapshot-${TIMESTAMP}.snap" --insecure
+
+                  echo "  Applying retention (keep last ${RETENTION_COUNT})..."
+                  mc ls minio/${MINIO_BUCKET}/ --insecure 2>/dev/null | \
+                    grep '\.snap' | \
+                    awk '{print $NF}' | \
+                    sort -r | \
+                    tail -n +$((RETENTION_COUNT + 1)) | \
+                    while read -r old_snap; do
+                      if [ -n "$old_snap" ]; then
+                        echo "  Deleting old snapshot: ${old_snap}"
+                        mc rm "minio/${MINIO_BUCKET}/${old_snap}" --insecure
+                      fi
+                    done
+
+                  echo "=== Backup Complete ==="
+{{- end }}

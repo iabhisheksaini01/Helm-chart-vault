@@ -1,0 +1,77 @@
+{{- if .Values.oidc.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "vault.fullname" . }}-oidc-config-job-{{ .Release.Revision }}
+  namespace: {{ .Release.Namespace }}
+spec:
+  ttlSecondsAfterFinished: 120
+  template:
+    spec:
+      serviceAccountName: {{ include "vault.fullname" . }}-vault-sa
+      restartPolicy: OnFailure
+      containers:
+        - name: oidc-config
+          image: alpine/k8s:1.29.2
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              
+              VAULT_ADDR="http://{{ include "vault.fullname" . }}-main:8200"
+              SECRET_NAME="{{ include "vault.fullname" . }}-main-vault-keys"
+              
+              echo "Waiting for Vault root token secret to be available..."
+              until kubectl get secret "$SECRET_NAME" -n {{ .Release.Namespace }} > /dev/null 2>&1; do
+                echo "  ...waiting for secret $SECRET_NAME, sleeping 5s"
+                sleep 5
+              done
+              
+              echo "Fetching Root Token..."
+              VAULT_TOKEN=$(kubectl get secret "$SECRET_NAME" -n {{ .Release.Namespace }} -o jsonpath='{.data.root-token}' | base64 -d)
+              
+              if [ -z "$VAULT_TOKEN" ]; then
+                echo "Error: Could not retrieve Vault Root Token!"
+                exit 1
+              fi
+
+              # Check if OIDC is already enabled
+              if curl -s -H "X-Vault-Token: $VAULT_TOKEN" "$VAULT_ADDR/v1/sys/auth" | jq -e '.["oidc/"]' > /dev/null 2>&1; then
+                echo "OIDC auth method already enabled."
+              else
+                echo "Enabling OIDC auth method..."
+                curl -s -H "X-Vault-Token: $VAULT_TOKEN" \
+                  --request POST \
+                  --data '{"type": "oidc"}' \
+                  "$VAULT_ADDR/v1/sys/auth/oidc"
+              fi
+
+              echo "Configuring OIDC with Keycloak..."
+              curl -s -H "X-Vault-Token: $VAULT_TOKEN" \
+                --request POST \
+                --data '{
+                  "oidc_discovery_url": "{{ .Values.oidc.discovery_url }}",
+                  "oidc_client_id": "{{ .Values.oidc.client_id }}",
+                  "oidc_client_secret": "{{ .Values.oidc.client_secret }}",
+                  "default_role": "{{ .Values.oidc.default_role }}"
+                }' \
+                "$VAULT_ADDR/v1/auth/oidc/config"
+
+              echo "Creating OIDC role: {{ .Values.oidc.default_role }}..."
+              curl -s -H "X-Vault-Token: $VAULT_TOKEN" \
+                --request POST \
+                --data '{
+                  "allowed_redirect_uris": [
+                    "{{ .Values.oidc.vault_url }}/ui/vault/auth/oidc/oidc/callback",
+                    "http://localhost:8250/oidc/callback"
+                  ],
+                  "user_claim": "sub",
+                  "token_policies": ["default"],
+                  "token_ttl": "1h",
+                  "token_max_ttl": "2h"
+                }' \
+                "$VAULT_ADDR/v1/auth/oidc/role/{{ .Values.oidc.default_role }}"
+
+              echo "OIDC Configuration Complete!"
+{{- end }}
